@@ -1,5 +1,7 @@
 @echo off
 setlocal EnableDelayedExpansion
+cd /d "%~dp0"
+if errorlevel 1 exit /b 1
 title Installer BOT CEK STOK (VPS Edition)
 
 echo ===================================================
@@ -76,12 +78,13 @@ echo [5/6] Menginstall Library Python...
 python -m pip install --upgrade setuptools wheel
 :: No-cache-dir untuk menghindari file corrupt di cache
 python -m pip install --no-cache-dir -r requirements.txt
-python -m pip install --no-cache-dir requests python-dotenv playwright aiohttp
+if errorlevel 1 goto INSTALL_ERROR
 
 :: 6. Install Browser
 echo.
 echo [6/6] Menginstall Browser...
 python -m playwright install chromium
+if errorlevel 1 goto INSTALL_ERROR
 
 echo.
 echo ===================================================
@@ -91,3 +94,10 @@ echo.
 echo Jalankan bot dengan membuka file: run_bot_vps.bat
 echo.
 pause
+
+exit /b 0
+
+:INSTALL_ERROR
+echo Instalasi gagal. Periksa pesan error di atas sebelum menjalankan bot.
+pause
+exit /b 1
