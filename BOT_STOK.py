@@ -5,12 +5,11 @@ import re
 import json
 import logging
 import asyncio
-import requests
 import time
 import contextlib
 from pathlib import Path
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 try:
     from playwright.async_api import async_playwright, TimeoutError as ATimeout
     import aiohttp 
@@ -67,8 +66,12 @@ def load_accounts():
 
 def save_accounts(data):
     try:
-        with open(ACCOUNTS_FILE, 'w', encoding='utf-8') as f:
+        temporary = ACCOUNTS_FILE.with_suffix('.json.tmp')
+        with open(temporary, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, ACCOUNTS_FILE)
         return True
     except Exception as e:
         logging.error(f"Gagal save accounts: {e}")
@@ -81,10 +84,29 @@ def parse_credential_line(s: str):
     return (email, pin) if (email and pin) else (None, None)
 
 def angka_awal(s: str) -> int:
-    m = re.search(r"(\d+)", s or "")
-    if m:
-        return int(m.group(1))
-    return -1
+    """Baca bilangan bulat termasuk pemisah ribuan Indonesia."""
+    match = re.search(r"(?<![\d.,])(?:\d{1,3}(?:[.,]\d{3})+|\d+)(?![\d.,])", s or "")
+    return int(re.sub(r"[.,]", "", match.group())) if match else -1
+
+
+REPORT_LABELS = {
+    "Rumah Tangga": "RT", "Usaha Mikro": "UM", "Petani Sasaran": "PS",
+    "Nelayan Sasaran": "NS", "Pengecer": "P", "Subpangkalan": "SP",
+    "Total Tabung Terjual": "Total",
+}
+
+
+def report_value(content, label):
+    # Batasi pencarian pada kategori ini agar tidak mengambil angka kategori berikutnya.
+    boundaries = "|".join(re.escape(x) for x in REPORT_LABELS)
+    match = re.search(re.escape(label) + r"(.*?)(?=" + boundaries + r"|$)",
+                      content, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return "Tidak Diketahui"
+    value = re.search(r"([\d.,]+)\s*(?:Tbg|Tabung)\b", match.group(1), re.IGNORECASE)
+    number = angka_awal(value.group(1)) if value else -1
+    return str(number) if number >= 0 else "Tidak Diketahui"
+
 
 def get_stok_tanda(jumlah: int) -> str:
     if jumlah < 0: return "❓"
@@ -104,22 +126,60 @@ def format_one_result(nama: str, stok: str) -> str:
     return f"<b>{escape(nama)}</b> | {escape(body)}"
 
 # ===================== ASYNC TELEGRAM HELPERS =====================
+def telegram_chunks(text, limit=3900):
+    chunks, current = [], ""
+    for block in text.split("\n\n"):
+        if len(block) > limit:
+            # Render oversized HTML blocks as plain text to avoid splitting markup.
+            from html import unescape
+            plain = unescape(re.sub(r"<[^>]*>", "", block))
+            pieces, piece = [], ""
+            for char in plain:
+                encoded = escape(char)
+                if len(piece) + len(encoded) > limit:
+                    pieces.append(piece)
+                    piece = ""
+                piece += encoded
+            pieces.append(piece)
+        else:
+            pieces = [block]
+        for piece in pieces:
+            joined = current + "\n\n" + piece if current else piece
+            if len(joined) > limit:
+                chunks.append(current)
+                current = piece
+            else:
+                current = joined
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 async def tg_send_async(text, chat_id, markup=None):
-    if not chat_id or not BOT_TOKEN: return
+    if not chat_id or not BOT_TOKEN:
+        return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if markup: payload["reply_markup"] = json.dumps(markup)
-    
     try:
-        # Disable SSL Verify (Workaround for Local/SSL Issues)
-        connector = aiohttp.TCPConnector(ssl=False)
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.post(url, json=payload, timeout=20) as resp:
-                if resp.status != 200:
-                    err_text = await resp.text()
-                    logging.error(f"TG Send Failed: {resp.status} - {err_text}")
+        async with aiohttp.ClientSession() as session:
+            for chunk in telegram_chunks(text):
+                payload = {"chat_id": chat_id, "text": chunk, "parse_mode": "HTML"}
+                if markup:
+                    payload["reply_markup"] = markup
+                for attempt in range(3):
+                    async with session.post(url, json=payload, timeout=20) as resp:
+                        data = await resp.json()
+                        if resp.status == 200 and data.get("ok"):
+                            break
+                        if resp.status == 429 and attempt < 2:
+                            await asyncio.sleep(data.get("parameters", {}).get("retry_after", 1))
+                            continue
+                        logging.error("Telegram menolak pesan: HTTP %s", resp.status)
+                        return False
+        return True
     except Exception as e:
-        logging.error(f"TG Send Error: {e}")
+        logging.error("Pengiriman Telegram gagal (%s)", type(e).__name__)
+        return False
+
 
 async def tg_send_menu_async(chat_id, text, state="MAIN"):
     if state == "MAIN":
@@ -147,11 +207,10 @@ def clear_screen():
 async def _login_and_setup(browser, email, pin):
     """Helper: Login dan navigate ke valid state. Return (context, page, nama_pangkalan)"""
     context = await browser.new_context()
-    page = await context.new_page()
-    page.set_default_timeout(60000)
-    page.set_default_navigation_timeout(60000)
-    
     try:
+        page = await context.new_page()
+        page.set_default_timeout(60000)
+        page.set_default_navigation_timeout(60000)
         logging.info(f"[{email}] Mulai proses login...")
         # === LOGIN ===
         logging.info(f"[{email}] Navigasi ke URL Login...")
@@ -175,7 +234,7 @@ async def _login_and_setup(browser, email, pin):
             await page.wait_for_timeout(1000)
             try:
                 # Cek dashboard loaded (indikator stok tabung visible)
-                if await page.locator("text=/\\b\\d+\\s+Tabung\\b/i").first.is_visible(timeout=500):
+                if await page.locator("text=/\\b[\\d.,]+\\s+Tabung\\b/i").first.is_visible(timeout=500):
                     login_success = True
                     logging.info(f"[{email}] Dashboard muncul!")
                     break
@@ -231,13 +290,13 @@ async def _login_and_setup(browser, email, pin):
 
         return context, page, nama
 
-    except Exception as e:
+    except BaseException:
         await context.close()
-        raise e
+        raise
 
 async def _set_date_filter(page):
     """Helper: Set filter tanggal (Awal Bulan - Hari Ini)"""
-    now = datetime.now()
+    now = datetime.now(timezone(timedelta(hours=7)))
     day_str = str(now.day)
     # month_str = now.strftime("%B") # Indo locale issue potentially, relying on UI state
     
@@ -262,7 +321,38 @@ async def _set_date_filter(page):
         
     except Exception as e:
         logging.warning(f"Gagal set tanggal: {e}")
-        # Lanjut saja, mungkin range default sudah benar/cukup
+        raise RuntimeError("Rentang tanggal laporan gagal disetel") from e
+
+async def read_stock(page):
+    """Read a uniquely identified stock counter, never the first sales quantity."""
+    for attempt in range(5):
+        candidates = await page.evaluate(r"""
+            () => {
+                const labels = /^(?:stok(?: akhir| tersedia| tabung| saat ini)?|sisa stok|sisa tabung)(?:\s*[:：]?\s*(?:[\d.,]+)(?:\s*(?:Tabung|Tbg))?)?\s*[:：]?$/i;
+                const number = /(?:^|[^\d.,])([\d]{1,3}(?:[.,]\d{3})+|[\d]+)\s*(?:Tabung|Tbg)\b/ig;
+                const values = [];
+                for (const el of document.querySelectorAll('body *')) {
+                    if (!el.getClientRects().length || !labels.test((el.innerText || '').trim())) continue;
+                    let node = el;
+                    for (let depth = 0; node && depth < 3; depth++, node = node.parentElement) {
+                        const text = node.innerText || '';
+                        if (text.length > 350) break;
+                        const matches = [...text.matchAll(number)].map(m => m[1].replace(/[.,]/g, ''));
+                        if (matches.length) {
+                            if (matches.length === 1) values.push(matches[0]);
+                            break;
+                        }
+                    }
+                }
+                return [...new Set(values)];
+            }
+        """)
+        if len(candidates) == 1:
+            return str(int(candidates[0]))
+        if attempt < 4:
+            await page.wait_for_timeout(1500)
+    raise RuntimeError("Stok akhir tidak ditemukan atau ada beberapa nilai stok yang berbeda")
+
 
 async def cek_stok_satu_async(browser, email: str, pin: str):
     try:
@@ -272,26 +362,16 @@ async def cek_stok_satu_async(browser, email: str, pin: str):
         return None
 
     try:
-        stok = "Tidak Diketahui"
-        for _ in range(5):
-            try:
-                el = page.locator("text=/\\b\\d+\\s+Tabung\\b/i").first
-                if await el.is_visible():
-                    txt = await el.inner_text()
-                    m = re.search(r"(\d+)", txt)
-                    if m:
-                        stok = m.group(1)
-                        break
-            except: pass
-            await page.wait_for_timeout(2000)
-        
+        stok = await read_stock(page)
+
         logging.info(f"Akun {email}: {nama} | Stok = {stok} Tabung")
-        await context.close()
         return (nama, stok)
     except Exception as e:
-        await context.close()
         logging.warning(f"Error cek stok {email}: {e}")
         return None
+    finally:
+        await context.close()
+
 
 async def cek_rekap_satu_async(browser, email: str, pin: str):
     """Fitur Rekap Penjualan: Total Tabung Terjual"""
@@ -327,22 +407,23 @@ async def cek_rekap_satu_async(browser, email: str, pin: str):
                   # Ambil text parentnya
                   parent = el.locator("..")
                   full_text = await parent.inner_text()
-                  m = re.search(r"(\d+)\s*Tbg", full_text)
+                  m = re.search(r"([\d.,]+)\s*(?:Tbg|Tabung)", full_text, re.IGNORECASE)
                   if m:
-                      total_stok = m.group(1)
+                      total_stok = str(angka_awal(m.group(1)))
         except Exception as e:
             logging.warning(f"Gagal scrape total: {e}")
 
         # Format Result: "NAAMA | Total: 100"
         result_str = f"Total: {total_stok} Tabung"
         
-        await context.close()
         return (nama, result_str)
 
     except Exception as e:
-        await context.close()
         logging.warning(f"Error rekap {email}: {e}")
         return None
+    finally:
+        await context.close()
+
 
 async def cek_jenis_pelanggan_satu_async(browser, email: str, pin: str):
     """Fitur Laporan Jenis Pelanggan"""
@@ -375,12 +456,7 @@ async def cek_jenis_pelanggan_satu_async(browser, email: str, pin: str):
             
             # Helper regex
             def get_val(label):
-                # Cari Label ... angka ... Tbg
-                pattern = re.compile(re.escape(label) + r".{0,100}?(\d+)\s*Tbg", re.IGNORECASE | re.DOTALL)
-                match = pattern.search(content)
-                if match:
-                    return match.group(1)
-                return "0"
+                return report_value(content, label)
 
             targets = {
                 "Rumah Tangga": "RT", 
@@ -402,6 +478,8 @@ async def cek_jenis_pelanggan_satu_async(browser, email: str, pin: str):
             
             # Total Tabung Terjual
             total_val = get_val("Total Tabung Terjual")
+            if total_val == "Tidak Diketahui":
+                raise RuntimeError("Total laporan tidak terbaca")
             total_str = f"Total Tabung Terjual : {total_val} Tbg"
             
             line_str = " | ".join(parts)
@@ -415,13 +493,14 @@ async def cek_jenis_pelanggan_satu_async(browser, email: str, pin: str):
             logging.error(f"Python Scraping error: {e}")
             body = f"Gagal scrape data: {e}"
 
-        await context.close()
         return (nama, body)
 
     except Exception as e:
-        await context.close()
         logging.warning(f"Error jenis pelanggan {email}: {e}")
         return None
+    finally:
+        await context.close()
+
 
 async def cek_laporan_lengkap_satu_async(browser, email: str, pin: str):
     """Gabungan Cek Stok & Jenis Pelanggan"""
@@ -431,19 +510,8 @@ async def cek_laporan_lengkap_satu_async(browser, email: str, pin: str):
 
     try:
         # 1. AMBIL STOK (Logic dari cek_stok)
-        stok = "Tidak Diketahui"
-        try:
-            for _ in range(5):
-                el = page.locator("text=/\\b\\d+\\s+Tabung\\b/i").first
-                if await el.is_visible():
-                    txt = await el.inner_text()
-                    m = re.search(r"(\d+)", txt)
-                    if m:
-                        stok = m.group(1)
-                        break
-                await page.wait_for_timeout(2000)
-        except: pass
-        
+        stok = await read_stock(page)
+
         logging.info(f"{nama}: Stok = {stok}. Lanjut cek laporan...")
 
         # 2. NAVIGASI KE LAPORAN
@@ -467,10 +535,7 @@ async def cek_laporan_lengkap_satu_async(browser, email: str, pin: str):
             content = await page.inner_text("body")
             
             def get_val(label):
-                pattern = re.compile(re.escape(label) + r".{0,100}?(\d+)\s*Tbg", re.IGNORECASE | re.DOTALL)
-                match = pattern.search(content)
-                if match: return match.group(1)
-                return "0"
+                return report_value(content, label)
 
             targets = {
                 "Rumah Tangga": "RT", "Usaha Mikro": "UM", "Petani Sasaran": "PS",
@@ -487,13 +552,14 @@ async def cek_laporan_lengkap_satu_async(browser, email: str, pin: str):
                     parts.append(f"{code} : {val} Tbg")
             
             total_val = get_val("Total Tabung Terjual")
+            if total_val == "Tidak Diketahui":
+                raise RuntimeError("Total laporan tidak terbaca")
             
         except Exception as e:
             logging.error(f"Scraping error: {e}")
             parts = []
-            total_val = "0"
+            raise RuntimeError("Data laporan gagal dibaca") from e
 
-        await context.close()
         
         # 4. FORMAT OUTPUT
         # 「 Pandu Wijaya 」
@@ -504,7 +570,7 @@ async def cek_laporan_lengkap_satu_async(browser, email: str, pin: str):
         jumlah = angka_awal(stok)
         tanda = get_stok_tanda(jumlah) if jumlah >= 0 else "❓"
         
-        header = f"╭─〔<b>*{nama}*</b> 〕"
+        header = f"╭─〔<b>{escape(nama)}</b> 〕"
         line_stok = f"┊・Stok: {stok} Tbg {tanda}"
         line_jenis = f"┊・{' | '.join(parts)}" if parts else "၊| Nihil"
         line_total = f"┊・Total Tabung Terjual : {total_val} Tbg\n╰┈"
@@ -513,9 +579,10 @@ async def cek_laporan_lengkap_satu_async(browser, email: str, pin: str):
         return (nama, full_text)
 
     except Exception as e:
-        await context.close()
         logging.warning(f"Error laporan lengkap {email}: {e}")
         return None
+    finally:
+        await context.close()
 
 
 async def process_batch_async(creds: list, worker_func, max_workers: int = 1):
@@ -543,31 +610,31 @@ async def process_batch_async(creds: list, worker_func, max_workers: int = 1):
         await asyncio.sleep(3)
 
         async def one_account(email: str, pin: str):
-            try:
-                async with sem:
-                    # Timeout 3.5 menit per akun
-                    res = await asyncio.wait_for(
-                        worker_func(browser, email, pin),
-                        timeout=210 
-                    )
+            async with sem:
+                for attempt in range(1, 4):
+                    try:
+                        res = await asyncio.wait_for(worker_func(browser, email, pin), timeout=210)
+                        if res:
+                            results.append(res)
+                            await asyncio.sleep(3)
+                            return
+                    except Exception as e:
+                        logging.warning("Akun %s gagal pada percobaan %s/3 (%s)",
+                                        email, attempt, type(e).__name__)
+                    if attempt < 3:
+                        await asyncio.sleep(3 * attempt)
+                failures.append(email)
 
-                    # Jeda 3 detik sebelum lanjut (User Request)
-                    logging.info("⏳ Jeda 3 detik...")
-                    await asyncio.sleep(3)
-
-                if res:
-                    results.append(res)
-                    return
-            except ATimeout:
-                logging.warning(f"Timeout untuk akun {email}")
-            except Exception as e:
-                logging.warning(f"Error untuk akun {email}: {e}")
-            
-            failures.append(f"{email}|{pin}")
-
-        tasks = [asyncio.create_task(one_account(em, pn)) for (em, pn) in creds]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await browser.close()
+        # Repeated identical credentials should not produce duplicate reports.
+        tasks = [asyncio.create_task(one_account(em, pn)) for em, pn in dict.fromkeys(creds)]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await browser.close()
 
     return results, failures
 
@@ -607,7 +674,7 @@ async def handle_update(upd):
     
     # Simple State Management
     state = user_states.get(chat_id, "MAIN")
-    logging.info(f"[{chat_id}] Msg: {text} | State: {state}")
+    logging.info("Pesan diterima dari chat %s; state=%s", chat_id, state)
     
     # --- COMMAND HANDLER ---
     if text.lower() == "/start":
@@ -632,7 +699,7 @@ async def handle_update(upd):
             
         elif text == "INPUT AKUN":
             user_states[chat_id] = "WAITING_INPUT_AKUN"
-            await tg_send_menu_async(chat_id, "📝 <b>INPUT AKUN</b>\n\nMasukkan akun (email|pin).\n\nData ini akan diproses otomatis setiap Jam 08:05.", "WAITING")
+            await tg_send_menu_async(chat_id, "📝 <b>INPUT AKUN</b>\n\nMasukkan akun (email|pin).\n\nData ini akan diproses otomatis setiap Jam 08:05 WIB.", "WAITING")
 
         else:
             await tg_send_async("Gunakan tombol menu ya.", chat_id)
@@ -650,7 +717,9 @@ async def handle_update(upd):
                 
                 if valid_creds:
                      accounts_data[chat_id] = valid_creds
-                     save_accounts(accounts_data)
+                     if not save_accounts(accounts_data):
+                         await tg_send_async("❌ Gagal menyimpan akun. Silakan coba kembali.", chat_id)
+                         return
                      user_states[chat_id] = "MAIN"
                      await tg_send_menu_async(chat_id, f"✅ Sukses menyimpan {len(valid_creds)} akun untuk proses otomatis harian.", "MAIN")
                 else:
@@ -666,7 +735,21 @@ async def handle_update(upd):
         else:
              await tg_send_async("❌ Format salah. Wajib pakai separator '|'. Contoh: email|pin", chat_id)
 
+active_jobs = set()
+
+
 async def process_user_request(chat_id, text, state):
+    if chat_id in active_jobs:
+        await tg_send_async("⏳ Pengecekan sebelumnya masih berjalan. Tunggu sampai selesai.", chat_id)
+        return
+    active_jobs.add(chat_id)
+    try:
+        await _process_user_request(chat_id, text, state)
+    finally:
+        active_jobs.discard(chat_id)
+
+
+async def _process_user_request(chat_id, text, state):
     """Background task untuk memproses request user"""
     lines = text.splitlines()
     creds = []
@@ -714,30 +797,29 @@ async def process_user_request(chat_id, text, state):
                     await tg_send_async("❌ Tidak ada hasil.", chat_id)
 
             if failures:
-                fail_msg = "⚠️ Gagal/Timeout:\n" + "\n".join(failures[:10])
+                fail_msg = "⚠️ Masih gagal setelah 3 percobaan:\n" + "\n".join(escape(value) for value in failures[:10])
                 if len(failures) > 10: fail_msg += f"\n...dan {len(failures)-10} lainnya"
                 await tg_send_async(fail_msg, chat_id)
                 
             if invalid_lines:
-                inv_msg = "⚠️ Format salah (skip):\n" + "\n".join(invalid_lines[:5])
+                inv_msg = f"⚠️ {len(invalid_lines)} baris dilewati karena format salah."
                 await tg_send_async(inv_msg, chat_id)
 
-            await tg_send_async("✅ Done bang.!", chat_id)
+            await tg_send_async(f"✅ Proses selesai. Berhasil: {len(results)}; gagal: {len(failures)}.", chat_id)
             
             # Request USER: Pembersihan log
-            clear_screen()
-            logging.info("🧹 Terminal logs cleaned.")
+            logging.info("Proses laporan selesai.")
 
         except Exception as e:
             logging.error(f"Error task user {chat_id}: {e}")
-            await tg_send_async(f"❌ Terjadi kesalahan sistem: {e}", chat_id)
+            await tg_send_async("❌ Terjadi kesalahan sistem. Periksa log bot.", chat_id)
     else:
         await tg_send_async("❌ Tidak ada akun valid yang ditemukan.", chat_id)
 
 
 async def daily_scheduler():
     while True:
-        now = datetime.now()
+        now = datetime.now(timezone(timedelta(hours=7)))
         target = now.replace(hour=8, minute=5, second=0, microsecond=0)
         if now >= target:
             target = target + timedelta(days=1)
@@ -768,25 +850,26 @@ async def daily_scheduler():
 async def main_loop():
     logging.info(f"🤖 Bot Started Async Mode (PID: {os.getpid()})")
     logging.info(f"Headless Mode: {HEADLESS}")
-    print(f"Bot Token: {BOT_TOKEN[:5]}...{BOT_TOKEN[-5:] if BOT_TOKEN else ''}")
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN belum diset di BOT_STOK.env")
     
     asyncio.create_task(daily_scheduler())
     
     offset = 0
-    logging.info("🚀 Memulai Loop Polling (Requests Method)...")
+    logging.info("🚀 Memulai polling Telegram...")
     offset = 0
     while True:
         try:
-            # Polling Telegram via Requests (Wrapped in Thread)
+            # Polling async dengan verifikasi sertifikat TLS.
             url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
             params = {"timeout": 20, "offset": offset}
             
-            # Disable SSL warning
-            requests.packages.urllib3.disable_warnings() 
-            resp = await asyncio.to_thread(requests.get, url, params=params, timeout=30, verify=False)
-            
-            if resp.status_code == 200:
-                data = resp.json()
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, timeout=30) as resp:
+                    status = resp.status
+                    data = await resp.json()
+
+            if status == 200 and data.get("ok"):
                 result = data.get("result", [])
                 
                 if result:
@@ -794,13 +877,13 @@ async def main_loop():
                 
                 for update in result:
                     offset = update["update_id"] + 1
-                    asyncio.create_task(handle_update(update))
+                    await handle_update(update)
             else:
-                logging.warning(f"Polling gagal: {resp.status_code} - {resp.text}")
+                logging.warning("Polling gagal: HTTP %s", status)
                 await asyncio.sleep(5)
         
         except Exception as e:
-            logging.error(f"Polling Error: {e}")
+            logging.error("Polling gagal (%s)", type(e).__name__)
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
@@ -808,3 +891,4 @@ if __name__ == "__main__":
         asyncio.run(main_loop())
     except KeyboardInterrupt:
         print("Bot stopped.")
+
